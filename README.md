@@ -5,7 +5,7 @@
 
 后续将系统整理为`Java`面试指南，敬请期待！
 
-更多内容欢迎访问我的**[个人博客](http://www.nm83.com)**！
+更多内容欢迎访问我的[个人博客](http://www.nm83.com)！
 
 ### 内容简介
 
@@ -25,3 +25,13 @@
 
 
 ### 持续更新中...
+
+
+
+#### 友情链接
+
+- **[个人博客](http://www.nm83.com)**
+
+- **[码云](https://gitee.com/jerusalem01/tesco-mall)**
+
+- **[GitHub](https://github.com/Jerusalem01/tesco-mall)**
