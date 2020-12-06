@@ -1,0 +1,123 @@
+## 充分理解并解决跨域问题
+
+现在项目偏向于前后端分离的方式，前后端分离产生了跨域问题。
+
+### 1. 跨域产生的条件
+
+- 使用xmlHttpRequest，即我们通常说的ajax请求
+- 浏览器做了这个事
+- 访问的域名不同
+
+以上三个条件缺一不可。
+
+### 2. 如何解决跨域问题
+
+解决跨域问题的根本就是要打破上述的三个限制中的任何一个，我们来看一下逐个击破的方式。
+
+#### 2.1 JSONP方式
+
+jsonp是打破第一重限制，用了XMLHttpRequest就跨域，那我不用这种方式了，我们怎么做的，来看一段jquery的带jsonp的ajax请求
+
+```
+$.ajax({
+   type : "GET",
+   url : "http://api.map.baidu.com/geocoder/v2/",
+   data:"address=上海",
+   dataType:"jsonp",
+   jsonp:"callback",
+   jsonpCallback:"showLocation",
+   success : function(data){
+	   alert("成功");
+   },
+   error : function(data){
+   	   alert("失败");
+   }
+});
+```
+
+看似用了ajax请求，其实内部完全不是那么回事，多了jsonp和jsonpCallback选项，它内部将代码翻译并把页面上的dom操作成这样
+
+```
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+  </head>
+  <body>
+    <script type='text/javascript'>
+      // 后端返回直接执行的方法，相当于执行这个方法，由于后端把返回的数据放在方法的参数里，所以这里能拿到res。
+      window.showLocation = function (res) {
+        console.log(res)
+        //执行ajax回调
+      }
+    </script>
+    <script src='http://api.map.baidu.com/geocoder/v2/?address=上海&callback=showLocation' type='text/javascript'></script>
+  </body>
+</html>
+```
+
+这个时候，html页面的script src标签回去访问api.map.baidu.com的服务端，由于script，img这种标签浏览器是不受xmlhttprequest限制的，可以随意访问，这个时候对应的后端代码取得address参数，最后根据双方约定好的callback参数，返回一个被包装后的json，即
+
+```
+showLocation({
+	status: 0,
+	result: {
+		location: {
+			lng: 121.4219317908279,
+			lat: 31.361653367912695
+		},
+		precise: 1,
+		confidence: 80,
+		comprehension: 99,
+		level: "道路"
+	}
+})
+```
+
+然后浏览器直接执行了对应的这个showLocation()等等，相当于执行了我们上面定义的window.showLocation方法并且传入了我们需要的json返回，那我们的ajax success方法里就可以得到这个返回类型了，并且没有跨域，很精妙。
+
+#### 2.2 CORS
+
+CORS是一个W3C标准，全称是"跨域资源共享"（Cross-origin resource sharing）跨域资源共享 CORS 详解。这个玩样用于“破解”掉浏览器的限制，说是破解其实也是浏览器认识到了一些头部就放行了的意思，需要在http的response内多设置几个头部
+
+- Access-Control-Allow-Origin:* 表明允许所有的origin（浏览器的html页面路径）访问，而并非是同源的origin
+- Access-Control-Request-Method:* 表明允许所有的http request头，访问，因为浏览器在触发如下几个场景会在发送真正的数据前发送options这样的预检请求检测，一旦预检通过后才会发送真正的get或post数据请求，这个时候我们按照cors的设置就需要允许对应的method访问，触发的几种情况包括
+  1:请求的方法不是GET/HEAD/POST
+  2:POST请求的Content-Type并非application/x-www-form-urlencoded, multipart/form-data, 或text/plain
+  3:请求设置了自定义的header字段等
+- Access-Control-Allow-Headers:* 设置所有header均可以被允许，这个配置联通上述的request method options检测一起使用，可以在需要自定义header的场景下使用
+- Access-Control-Allow-Credentials：true 这个参数只有当需要跨域使用cookie传递时才需要设置为true，并且需要前端ajax配置使用xhrField:{withCredential:true}时才能传递cookie，另外safari和最新版本的chrome浏览器还需要在设置内放开对应限制,当这个参数被设置成true时候Access-Control-Allow-Origin就不能设置为*，否则就变成任何origin域都能允许传递cookie了，可将其调整为前端origin字段传什么我就用什么
+
+若你使用的是nginx反向代理，则可以直接在nginx反向代理上配置
+
+```
+location /{
+	proxy_pass http://backendserver;
+	add_header Access-Control-Allow-Methods *;
+	add_header Access-Control-Allow-Credentials true;
+	add_header Access-Control-Allow-Origin $http_origin;
+	add_header Access-Control-Allow-Headers *;
+}
+```
+
+#### 2.3 代理法
+
+打破不同源的限制，我只要让它同源就可以了，比如要我的静态页面是 http://a.com/index.html 动态ajax请求访问的是http://b.com/api/***
+我只需要将对应的服务部署在不同的机器上，然后使用一个公共的c.com的域名作为nginx反向代理的入口域名，在将静态服务和动态服务分别挂在后面的被代理局域网服务器内，修改配置
+
+```
+server{
+	listen:80;
+	server_name: c.com;
+
+	#静态资源
+	location /{
+		proxy_pass http://localhost:8080/;
+	}
+
+	#ajax动态请求
+	location /api{
+		proxy_pass http://localhost:8081/;
+	}
+}
+```

@@ -219,7 +219,10 @@ vi /etc/cloud/cloud.cfg
 #### 2.2 单一节点配置
 
 - **配置IP**
-  `vi /etc/netplan/50-cloud-init.yaml`
+  
+  ````
+  vi /etc/netplan/50-cloud-init.yaml
+  ````
 
 ```
 添加   
