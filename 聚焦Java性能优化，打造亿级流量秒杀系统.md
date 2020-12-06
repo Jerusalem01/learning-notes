@@ -321,19 +321,17 @@ server.tomcat.accesslog.directory=/usr/local/seckill/logs
 
 - 修改前端代码
 
-### 3. 查询性能优化 - 多级缓存
+### 3. 查询性能优化 - 实现多级缓存
 
-#### 3.1 缓存设计原则
+#### 	缓存设计原则
 
 - 用快速存取设备，用内存
 - 将缓存推到离用户最近的地方
 - 脏缓存清理
 
-#### 3.2 实现多级缓存
+#### 3.1 Redis缓存
 
-##### 3.2.1 Redis缓存
-
-- 单机版
+##### 3.1.1 单机版
 
 ```
 //存入Redis
@@ -391,62 +389,279 @@ public class RedisSessionConfig {
 }
 ```
 
-- Sentinal哨兵模式
-- 集群cluster模式
+##### 3.1.2 Sentinal哨兵模式
 
 
 
+##### 3.1.3 集群cluster模式
 
 
 
+#### 3.2 本地热点缓存
 
-
-
-
-
-
-
-
-
-
-
-##### 3.2.2 本地热点缓存
-
-**特点：**
+##### 3.2.1 **特点**
 
 - 热点数据
 - 脏读非常不敏感
 - 内存可控
 
-**解决方案： Guava cache**
+##### 3.2.2 解决方案 -  Guava cache
 
 - 可控制的大小和超时时间
 - 可配置的lru策略（达到存储上限后，最近最少被访问的key优先被淘汰）
 - 线程安全
 
-##### 3.2.3 nginx proxy cache 缓存
+#### 3.3 nginx+lua 缓存
 
-##### 3.2.4 nginx lua 缓存
+##### 3.3.1 原理解析
 
+- **lua协程机制**
+  - 依附于线程的内存模型，切换开销小
+  - 遇阻塞及归还执行权，代码同步
+  - 无需加锁
 
+- **nginx协程机制**
 
+  - nginx每个工作进程创建一个lua虚拟机
+  - 工作进程内的所有协程共享同一个VM
+  - 每个外部请求由一个lua协程处理，之间数据隔离
+  - lua代码调用io等异步接口时，协程被挂起，上下文数据保持不变
+  - 自动保存，不阻塞工作进程
+  - io异步操作完成后还原协程上下文，代码继续执行
 
+  **Nginx处理阶段：**
 
+  ![](E:\程序人生\个人学习笔记\学习笔记图床\QQ图片20201206161316.png)
 
+- **nginx lua插载点**
 
+  - init_by_lua：系统启动时调用
+  - init_worker_by_lua：worker进程启动时调用
+  - set_by_lua：nginx变量用复杂lua return
+  - rewrite_by_lua：重写url规则
+  - access_by_lua：权限验证阶段
+  - content_by_lua：内容输出节点
 
+![](E:\程序人生\个人学习笔记\学习笔记图床\QQ图片20201206161545.png)
 
+- **OpenResty**
+  - OpenResty由Nginx核心和很多第三方模块组成，默认集成了lua开发环境，使Nginx可以作为一个Web Server使用
+  - 借助于Nginx的事件驱动模型和非阻塞IO，可以实现高性能的Web应用程序
+  - OpenResty提供了大量组件，如Mysql，Redis，Memcached等，使在Nginx上开发Web应用程序更方便更简单
 
+##### 3.3.2 方式一： share dic 共享内存字典（存在脏读问题）
 
+- 编写lua脚本 - itemsharedic.lua
 
+```
+function get_from_cache(key)
+        local cache_ngx = ngx.shared.my_cache
+        local value = cache_ngx:get(key)
+        return value
+end
 
+function set_to_cache(key,value,exptime)
+        if not exptime then
+                exptime = 0
+        end
+        local cache_ngx = ngx.shared.my_cache
+        local succ,err,forcible = cache_ngx:set(key,value,exptime)
+        return succ
+end
 
+local args = ngx.req.get_uri_args()
+local id = args["id"]
+local item_model = get_from_cache("item_"..id)
+if item_model == nil then
+        local resp = ngx.location.capture("/item/get?id="..id)
+        item_model = resp.body
+        set_to_cache("item_"..id,item_model,1*60)
+end
+ngx.say(item_model)
+```
 
+- 配置nginx.conf
 
+加入shared dictionary的扩展，声明128m的共享字典的访问内存
 
+```
+lua_shared_dict my_cache 128m;
+```
 
+- 设置location用来访问shared dict的lua文件
 
+```
+location /itemlua/get {
+		default_type 'application/json';
+		content_by_lua_file '/usr/local/openresty/lua/itemsharedic.lua';
+}
+```
 
+**适用场景：**更新较少，热点数据
 
+##### 3.3.3 方式二：Redis的支持
 
+- 编写lua脚本 - itemredis.lua
 
+```
+local args = ngx.req.get_uri_args()
+local id = args[ "id"]
+local redis= require "resty.redis"
+local cache= redis:new()
+local ok,err = cache:connect("192.168.75.140",6379)   //连接只读Redis，只读操作
+local item_model= cache:get("item_"..id)
+if item_model == ngx.null or item_model = nil then
+       local resp = ngx.location.capture("/item/get?id="..id) 
+       item_model= resp.body
+end
+ngx.say(item_model)
+```
+
+- 配置nginx.conf
+
+```
+location /itemlua/get {
+		default_type 'application/json';
+		content_by_lua_file '/usr/local/openresty/lua/itemredis.lua';
+}
+```
+
+**适用场景：**更新较多，非热点数据
+
+#### 3.4 nginx proxy cache 缓存（不推荐）
+
+##### 3.4.1 前置条件
+
+- Nginx反向代理
+- 依靠文件系统存索引级的文件
+- 依靠内存缓存文件地址
+
+##### 3.4.2 配置步骤
+
+1. 申明一个cache缓存节点的路径
+
+   ```
+   proxy_cache_path /usr/local/openresty/nginx/cache_temp levels=1:2 keys_zone=tmp_cache:100m inactive=7d max_size=100g;
+   ```
+
+   参数说明：
+
+   - /usr/local/openresty/nginx/cache_temp：设置缓存文件路径
+   - levels：目录设置两层结构用来缓存
+   - keys_zone：指定了一个叫tmp_cache的缓存区，并且设置了100m的内存用来存储缓存key到文件路径的位置 
+   - inactive：缓存文件超过7天后自动释放淘汰
+   - max_size：缓存文件总大小超过100g后自动释放淘汰
+
+2. location内加入
+
+   ```
+   proxy_cache tmp_cache;   //缓存节点名称
+   proxy_cache_valid 200 206 304 302 7d;		//只缓存指定的状态码的请求
+   proxy_cache_key $request_uri;			//将请求uri作为缓存的key
+   ```
+
+##### 3.4.3 发现问题 - 效果反而下降：
+
+​		这种缓存方法读取的Nginx的本地文件，并没有将文件缓存到Nginx的内存中，所以效果并不好，不推荐。
+
+**总结：**
+
+- **在大型的应用集群中若对Redis访问过度依赖，会因为应用服务器到Redis之间的网络带宽产生瓶颈**
+
+  针对读请求导致的性能瓶颈，只需要在数据写入过程中复制一份，数据就变成两份，数据读能力就扩展了一倍。
+  针对写请求，redis是key-value存储结构，通过对写请求key做sharding，分散到不同的master实例上，解决写的瓶颈问题。
+
+- 架构的越顶层性能越高，占用的系统资源越昂贵，更新机制越难
+- 架构的底层更容易集中式的存储数据，但是性能最差
+
+![](E:\程序人生\个人学习笔记\学习笔记图床\QQ图片20201206175610.png)
+
+所以，**无通用的解决方案，结合场景选择合适的架构**
+
+### 4. 查询性能优化 - 页面静态化
+
+![](E:\程序人生\个人学习笔记\学习笔记图床\页面静态化.png)
+
+#### 4.1 实现静态资源CDN及其原理解析
+
+- DNS用CNAME解析到源站
+- 回源缓存设置
+- 强推失效
+
+##### 4.1.1 cache-control响应头
+
+<img src="E:\程序人生\个人学习笔记\学习笔记图床\cache-control.png" style="zoom:80%;" />
+
+- private：客户端可以缓存
+- publlic：客户端和代理服务器都可以缓存
+- max-age=xxx：缓存的内容将在XXX秒后失效
+- no-cache：强制向服务端再验证一次
+- no-store：不缓存请求的任何返回内容
+
+##### 4.1.2 有效性判断
+
+- ETag：资源唯一标识
+- If-None-Match：客户端发送的匹配ETag标识符
+- Last-modified：资源最后被修改的时间
+- If-Modified-Since：客户端发送的匹配资源最后修改时间的标识符
+
+<img src="E:\程序人生\个人学习笔记\学习笔记图床\QQ图片20201206194105.png" style="zoom:80%;" />
+
+**协商机制**：比较Last-modified和ETag到服务端，若服务端判断没变化则304不返回数据，否则200返回数据
+
+##### 4.1.3 浏览器的刷新方式
+
+- 回车刷新或a链接
+- F5刷新或command+R刷新
+
+- ctrl+F5或command+shift+R刷新
+
+##### 4.1.4 CDN自定缓存策略
+
+- 可自定义目录过期时间
+- 可自定义后缀名过期时间
+- 可自定义对应策略权重
+- 可通过界面或api强制cdn对应目录刷新（非保成功）
+
+<img src="E:\程序人生\个人学习笔记\学习笔记图床\QQ图片20201206195202.png" style="zoom: 80%;" />
+
+##### 4.1.5 静态资源部署策略
+
+**（一）**
+
+- css,js,img等元素使用版本号部署（不便利，维护困难）
+
+- css,js,img等元素使用带摘要部署（存在先部署html还是先部署资源的覆盖问题）
+- css,js,img等元素使用摘要做文件名部署，新老版本并存且可回滚，资源部署完后在部署html（推荐）
+
+**（二）**
+
+- 对应静态资源保持生命周期内不会变，max-age可设置的很长，无视失效更新周期
+- html文件设置no-cache或较短max-age，以便于更新
+- html文件仍然设置较长的mac-age，依靠动态的获取版本号请求发送到后端，异步下载最新的版本号的html后展示渲染在前端
+
+**（三）**
+
+- 动态请求也可以静态化成json资源推送到cdn上
+- 依靠异步请求获取后端节点对应的资源状态做紧急下架处理
+- 可通过跑批紧急推送cdn内容以使其下架等操作
+
+#### 4.2 全页面静态化（*）
+
+##### 4.2.1 概念
+
+在服务端完成html，css，甚至js的load渲染成纯html文件后，直接以静态资源的方式部署到cdn上。
+
+##### 4.2.2 phantomjs应用 - 无头浏览器
+
+- 修改需要全页面静态化的实现，采用initView和hasInit方式防止多次初始化
+- 编写对应轮询生成内容方式
+- 将全静态化页面生成后推送到cdn
+
+### 5. 交易性能优化 - 缓存库存
+
+#### 现存交易性能瓶颈
+
+- 交易验证完全依赖于数据库
+- 库存行锁
+- 后置处理逻辑
