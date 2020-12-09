@@ -660,8 +660,194 @@ location /itemlua/get {
 
 ### 5. 交易性能优化 - 缓存库存
 
-#### 现存交易性能瓶颈
+#### 交易性能瓶颈
 
 - 交易验证完全依赖于数据库
 - 库存行锁
 - 后置处理逻辑
+
+#### 5.1 优化交易验证
+
+- 用户风控策略优化：策略缓存模型化
+- 活动校验策略优化：引入活动发布流程，模型缓存化，紧急下线功能
+
+  **具体实现见代码优化**
+
+#### 5.2 优化库存行锁
+
+##### 5.2.1 解决方案
+
+- 扣减库存缓存化
+
+- 异步同步数据库
+
+- 库存数据库最终一致性保证
+
+  **具体实现见代码优化**
+
+##### 5.2.2 部署RocketMq
+
+- docker-compose
+
+```
+version: '3.3'
+services:
+  rmqnamesrv:
+    image: foxiswho/rocketmq:server
+    container_name: rmqnamesrv
+    ports:
+      - 9876:9876
+    volumes:
+      - ./data/logs:/opt/logs
+      - ./data/store:/opt/store
+    networks:
+        rmq:
+          aliases:
+            - rmqnamesrv
+  
+  rmqbroker:
+    image: foxiswho/rocketmq:broker
+    container_name: rmqbroker
+    ports:
+      - 10909:10909
+      - 10911:10911
+    volumes:
+      - ./data/logs:/opt/logs
+      - ./data/store:/opt/store
+      - ./data/brokerconf/broker.conf:/etc/rocketmq/broker.conf
+    environment:
+        NAMESRV_ADDR: "rmqnamesrv:9876"
+        JAVA_OPTS: " -Duser.home=/opt"
+        JAVA_OPT_EXT: "-server -Xms128m -Xmx128m -Xmn128m"
+    command: mqbroker -c /etc/rocketmq/broker.conf
+    depends_on:
+      - rmqnamesrv
+    networks:
+      rmq:
+        aliases:
+          - rmqbroker
+
+  rmqconsole:
+    image: styletang/rocketmq-console-ng
+    container_name: rmqconsole
+    ports:
+    	- 8080:8080
+    environment:
+        JAVA_OPTS: "-Drocketmq.namesrv.addr=rmqnamesrv:9876 -Dcom.rocketmq.sendMessageWithVIPChannel=false"
+    depends_on:
+        - rmqnamesrv
+    networks:
+        rmq:
+          aliases:
+            - rmqconsole
+
+networks:
+    rmq:
+        driver: bridge
+```
+
+```
+docker update --restart=always XXX
+```
+
+**具体实现见代码优化**
+
+##### 5.2.3 问题
+
+- 异步消息发送失败
+- 扣减操作执行失败
+- 下单失败无法正确回滚库存
+
+### 6. 交易性能优化 - 事务型消息 
+
+- 事务型消息应用
+- 库存流水状态
+- 库存售罄处理方案
+
+### 7. 流量削峰技术
+
+#### 7.1 秒杀令牌
+
+##### 7.1.1 原理
+
+- 秒杀接口需要依靠令牌才能进入
+- 秒杀的令牌由秒杀活动模块负责生成
+- 秒杀活动模块对秒杀令牌生成全权处理，逻辑收口
+- 秒杀下单前需要先获取秒杀令牌
+
+#### 7.2 秒杀大闸
+
+##### 7.2.1 原理
+
+- 依靠秒杀令牌的授权原理定制化发牌逻辑，做到大闸功能
+- 根据秒杀商品初始库存颁发对应数量令牌，控制大闸流量
+- 用户风控策略前置到秒杀令牌发放中
+- 库存售罄判断前置到秒杀令牌发放中
+
+#### 7.3 队列泄洪
+
+##### 7.3.1 原理
+
+- 依靠排队去限制并发流量
+- 依靠排队和下游拥塞窗口程度调整队列释放流量大小
+- 典型案例：支付宝银行网关队列
+
+##### 7.3.2 代码实现
+
+- 本地：将队列维护在本地内存中
+
+```
+    private ExecutorService executorService;
+
+    /***
+     * 同步调用线程池的submit方法
+     * 拥塞窗口为20的等待队列，实现队列泄洪
+     */
+    @PostConstruct
+    public void init(){
+        executorService = Executors.newFixedThreadPool(20);
+    }
+```
+
+- 分布式：将队列设置到外部redis中
+
+### 8. 防刷限流
+
+#### 8.1 验证码生成与验证技术 - 错峰
+
+- 包装秒杀令牌前置，验证码错峰
+- 数学公式验证码生成器
+
+#### 8.2 限流原理与实现
+
+##### 8.2.1 方案
+
+- 限并发
+- 令牌桶算法（可以应对突发流量）
+- 漏桶算法（固定速率）
+
+##### 8.2.2  实现
+
+```
+    /***
+     * 限流
+     */
+    @PostConstruct
+    public void init(){
+        orderCreateRateLimiter = RateLimiter.create(300);
+    }
+```
+
+#### 8.3 防黄牛技术
+
+##### 8.3.1 传统防刷
+
+- 限制一个会话在一定时间内接口调用次数（无法解决多会话接入的问题）
+
+- 限制一个ip在一定时间内接口调用次数（不好控制，容易误伤）
+
+##### 8.3.2 设备指纹
+
+##### 8.3.3 凭证系统
+
+##### 
